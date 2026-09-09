@@ -1,0 +1,916 @@
+from __future__ import annotations
+
+import json
+import logging
+import math
+import os
+import re
+import tempfile
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+
+from dotenv import load_dotenv
+from telegram import (
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+    Update,
+)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    ConversationHandler,
+    MessageHandler,
+    filters,
+)
+
+from db import (
+    add_service,
+    approve_service,
+    delete_service,
+    get_approved_services,
+    get_pending_services,
+    get_service,
+    get_user_services,
+    init_db,
+)
+
+load_dotenv()
+
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+GOOGLE_VISION_API_KEY = os.getenv("GOOGLE_VISION_API_KEY", "").strip()
+GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY", "").strip()
+SEARCH_RADIUS_MILES = float(os.getenv("SEARCH_RADIUS_MILES", "100"))
+
+ADMIN_IDS = {
+    int(x.strip())
+    for x in os.getenv("ADMIN_IDS", "").split(",")
+    if x.strip().isdigit()
+}
+
+logging.basicConfig(
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger("truck-repair-finder")
+
+CHOOSE, INPUT, CONFIRM = range(3)
+
+MAIN_KB = ReplyKeyboardMarkup(
+    [
+        ["📍 Найти рядом", "➕ Добавить сервис"],
+        ["📋 Мои заявки", "ℹ️ Помощь"],
+    ],
+    resize_keyboard=True,
+)
+
+ADD_KB = ReplyKeyboardMarkup(
+    [
+        ["📷 Фото / скриншот"],
+        [KeyboardButton("📇 Отправить контакт", request_contact=True)],
+        ["✍️ Ввести вручную"],
+        ["❌ Отмена"],
+    ],
+    resize_keyboard=True,
+)
+
+SEARCH_LOCATION_KB = ReplyKeyboardMarkup(
+    [[KeyboardButton("📍 Отправить геолокацию", request_location=True)], ["❌ Отмена"]],
+    resize_keyboard=True,
+    one_time_keyboard=True,
+)
+
+CONFIRM_KB = ReplyKeyboardMarkup(
+    [["✅ Сохранить", "✏️ Изменить"], ["❌ Отмена"]],
+    resize_keyboard=True,
+)
+
+FORM = """📝 Заполните известные поля и отправьте всё одним сообщением:
+
+Название:
+Категория: Truck Repair
+Телефон:
+Адрес:
+Языки:
+Рейтинг:
+Отзывы:
+Часы:
+Сайт:
+Примечание:
+
+📍 Геолокацию сервиса отправлять не нужно — координаты определю по адресу.
+"""
+
+
+def haversine_miles(lat1, lon1, lat2, lon2):
+    r = 3958.7613
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+def clean(v):
+    return (v or "").strip()
+
+
+def request_json(url, *, data=None, headers=None):
+    headers = headers or {}
+    req = Request(url, data=data, headers=headers)
+    with urlopen(req, timeout=20) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def google_vision_ocr(image_bytes: bytes) -> str:
+    if not GOOGLE_VISION_API_KEY:
+        raise RuntimeError("GOOGLE_VISION_API_KEY is not configured")
+
+    url = (
+        "https://vision.googleapis.com/v1/images:annotate?"
+        + urlencode({"key": GOOGLE_VISION_API_KEY})
+    )
+    import base64
+    payload = {
+        "requests": [
+            {
+                "image": {"content": base64.b64encode(image_bytes).decode("ascii")},
+                "features": [{"type": "TEXT_DETECTION", "maxResults": 1}],
+            }
+        ]
+    }
+    result = request_json(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+
+    responses = result.get("responses", [])
+    if not responses:
+        return ""
+
+    response = responses[0]
+    if response.get("error"):
+        raise RuntimeError(response["error"].get("message", "Google Vision error"))
+
+    annotations = response.get("textAnnotations", [])
+    return annotations[0].get("description", "") if annotations else ""
+
+
+def google_geocode(address: str):
+    """Return (lat, lon, formatted_address) using Google Geocoding API."""
+    if not GOOGLE_MAPS_API_KEY:
+        raise RuntimeError("GOOGLE_MAPS_API_KEY is not configured")
+
+    url = "https://maps.googleapis.com/maps/api/geocode/json?" + urlencode(
+        {
+            "address": address,
+            "key": GOOGLE_MAPS_API_KEY,
+            "region": "us",
+        }
+    )
+    data = request_json(url)
+    status = data.get("status")
+
+    if status == "ZERO_RESULTS":
+        return None
+    if status != "OK":
+        raise RuntimeError(
+            f"Google Geocoding error: {status}: {data.get('error_message', '')}"
+        )
+
+    result = data["results"][0]
+    location = result["geometry"]["location"]
+    return (
+        float(location["lat"]),
+        float(location["lng"]),
+        result.get("formatted_address", address),
+    )
+
+
+def google_place_from_text(text: str):
+    """Try to resolve business name/address from OCR text with Places Text Search."""
+    if not GOOGLE_MAPS_API_KEY or not text.strip():
+        return None
+
+    # Use first useful lines as query. This helps Google identify a business
+    # from a business card or Google Maps screenshot.
+    lines = [x.strip() for x in text.splitlines() if x.strip()]
+    query = " ".join(lines[:8])[:500]
+    if not query:
+        return None
+
+    url = "https://places.googleapis.com/v1/places:searchText"
+    payload = {"textQuery": query, "languageCode": "en", "regionCode": "US"}
+    headers = {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": GOOGLE_MAPS_API_KEY,
+        "X-Goog-FieldMask": (
+            "places.displayName,places.formattedAddress,places.location,"
+            "places.nationalPhoneNumber,places.rating,places.userRatingCount,"
+            "places.websiteUri,places.regularOpeningHours"
+        ),
+    }
+
+    try:
+        data = request_json(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
+        )
+    except Exception:
+        logger.exception("Google Places lookup failed")
+        return None
+
+    places = data.get("places") or []
+    if not places:
+        return None
+
+    p = places[0]
+    location = p.get("location") or {}
+    hours = p.get("regularOpeningHours") or {}
+
+    return {
+        "name": (p.get("displayName") or {}).get("text", ""),
+        "address": p.get("formattedAddress", ""),
+        "phone": p.get("nationalPhoneNumber", ""),
+        "latitude": location.get("latitude"),
+        "longitude": location.get("longitude"),
+        "rating": p.get("rating"),
+        "review_count": p.get("userRatingCount"),
+        "website": p.get("websiteUri", ""),
+        "hours": "; ".join(hours.get("weekdayDescriptions") or []),
+    }
+
+
+def parse_rating(text):
+    # Typical Google Maps patterns: 4.8, 4.8 (127), 4.8 stars
+    m = re.search(r"\b([1-5](?:[.,]\d)?)\s*(?:★|stars?|звезд)?", text, re.I)
+    if not m:
+        return None
+    try:
+        value = float(m.group(1).replace(",", "."))
+        return value if 0 <= value <= 5 else None
+    except ValueError:
+        return None
+
+
+def parse_reviews(text):
+    patterns = [
+        r"([\d,.\s]+)\s*(?:reviews?|отзыв(?:ов|а)?|ratings?)",
+        r"\(([\d,.\s]+)\)",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, text, re.I)
+        if m:
+            digits = re.sub(r"\D", "", m.group(1))
+            if digits:
+                try:
+                    return int(digits)
+                except ValueError:
+                    pass
+    return None
+
+
+def parse_phone(text):
+    candidates = re.findall(
+        r"(?:\+?1[\s.\-()]*)?(?:\(?\d{3}\)?[\s.\-]*)\d{3}[\s.\-]*\d{4}",
+        text,
+    )
+    return candidates[0].strip() if candidates else ""
+
+
+def parse_website(text):
+    m = re.search(
+        r"(https?://[^\s]+|www\.[^\s]+|[A-Za-z0-9.-]+\.(?:com|net|org|us|biz)(?:/[^\s]*)?)",
+        text,
+        re.I,
+    )
+    return m.group(1).rstrip(".,)") if m else ""
+
+
+def detect_languages(text):
+    found = []
+    low = text.lower()
+    markers = [
+        ("Español", ["se habla español", "se habla espanol", "spanish", "español"]),
+        ("Русский", ["русский", "russian"]),
+        ("Кыргызча", ["кыргыз", "kyrgyz"]),
+        ("O‘zbekcha", ["uzbek", "o'zbek", "o‘zbek", "ўзбек"]),
+    ]
+    for language, words in markers:
+        if any(word in low for word in words):
+            found.append(language)
+    return ", ".join(found)
+
+
+def detect_hours(text):
+    low = text.lower()
+    if (
+        "24/7" in low
+        or "24 hours" in low
+        or "24hrs" in low
+        or "24 hrs" in low
+        or "24 hour" in low
+    ):
+        return "24/7"
+    return ""
+
+
+def detect_category(text):
+    low = text.lower()
+    if any(x in low for x in ["road service", "roadside", "mobile repair"]):
+        return "Roadside Service"
+    if any(x in low for x in ["tire", "tyre"]):
+        return "Truck Tire Service"
+    if any(x in low for x in ["diesel", "truck repair", "mechanic"]):
+        return "Truck Repair"
+    if "towing" in low or "tow " in low:
+        return "Towing"
+    return "Truck Repair"
+
+
+def guess_name(text):
+    lines = [x.strip() for x in text.splitlines() if x.strip()]
+    skip = re.compile(
+        r"(phone|tel|address|hours|review|rating|www\.|http|24 hours|road service|"
+        r"new and used|se habla|truck|trailer|forklift|\d{3}[- )])",
+        re.I,
+    )
+    for line in lines[:10]:
+        if len(line) <= 80 and not skip.search(line):
+            return line
+    return lines[0][:150] if lines else ""
+
+
+def parse_labeled_form(text):
+    aliases = {
+        "название": "name",
+        "name": "name",
+        "категория": "category",
+        "category": "category",
+        "телефон": "phone",
+        "phone": "phone",
+        "адрес": "address",
+        "address": "address",
+        "языки": "languages",
+        "languages": "languages",
+        "рейтинг": "rating",
+        "rating": "rating",
+        "отзывы": "review_count",
+        "reviews": "review_count",
+        "часы": "hours",
+        "часы работы": "hours",
+        "hours": "hours",
+        "сайт": "website",
+        "website": "website",
+        "примечание": "notes",
+        "notes": "notes",
+    }
+    result = {}
+    for line in text.splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        field = aliases.get(key.strip().lower())
+        if field and value.strip():
+            result[field] = value.strip()
+
+    if "rating" in result:
+        try:
+            result["rating"] = float(str(result["rating"]).replace(",", "."))
+        except ValueError:
+            result["rating"] = None
+
+    if "review_count" in result:
+        try:
+            result["review_count"] = int(re.sub(r"\D", "", str(result["review_count"])))
+        except ValueError:
+            result["review_count"] = None
+
+    return result
+
+
+def parse_ocr(text):
+    result = {
+        "name": guess_name(text),
+        "category": detect_category(text),
+        "phone": parse_phone(text),
+        "address": "",
+        "languages": detect_languages(text),
+        "rating": parse_rating(text),
+        "review_count": parse_reviews(text),
+        "hours": detect_hours(text),
+        "website": parse_website(text),
+        "notes": "",
+    }
+
+    # Keep useful OCR text as notes, but not excessively long.
+    useful_lines = [x.strip() for x in text.splitlines() if x.strip()]
+    result["notes"] = "; ".join(useful_lines[:15])[:1000]
+
+    place = google_place_from_text(text)
+    if place:
+        # Places data is more reliable than OCR for business details.
+        for field in ("name", "address", "phone", "rating", "review_count", "website", "hours"):
+            value = place.get(field)
+            if value not in (None, ""):
+                result[field] = value
+        if place.get("latitude") is not None:
+            result["latitude"] = float(place["latitude"])
+            result["longitude"] = float(place["longitude"])
+
+    return result
+
+
+def preview(d):
+    rating = d.get("rating")
+    reviews = d.get("review_count")
+
+    rating_line = ""
+    if rating is not None:
+        rating_line = f"\n⭐ {rating}/5"
+        if reviews is not None:
+            rating_line += f" · {reviews} отзывов"
+
+    lines = [
+        f"🔧 {clean(d.get('name')) or 'Название не указано'}{rating_line}",
+        f"🏷 {clean(d.get('category')) or 'Truck Repair'}",
+    ]
+
+    if clean(d.get("phone")):
+        lines.append(f"📞 {clean(d.get('phone'))}")
+    if clean(d.get("address")):
+        lines.append(f"📍 {clean(d.get('address'))}")
+    if clean(d.get("languages")):
+        lines.append(f"🌐 Языки: {clean(d.get('languages'))}")
+    if clean(d.get("hours")):
+        lines.append(f"🕐 {clean(d.get('hours'))}")
+    if clean(d.get("website")):
+        lines.append(f"🌍 {clean(d.get('website'))}")
+    if clean(d.get("notes")):
+        lines.append(f"📝 {clean(d.get('notes'))}")
+
+    lines.append("\nВсё правильно?")
+    return "\n".join(lines)
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 Добро пожаловать в Поиск Автосервисов!\n\n"
+        "📍 Найти рядом — сервисы в радиусе 100 миль\n"
+        "➕ Добавить сервис — добавить новый сервис\n"
+        "📋 Мои заявки — ваши добавленные сервисы\n"
+        "ℹ️ Помощь — справка",
+        reply_markup=MAIN_KB,
+    )
+
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📍 «Найти рядом» — отправьте свою геолокацию.\n"
+        "➕ «Добавить сервис» — можно отправить фото/скриншот, контакт или заполнить форму.\n\n"
+        "При добавлении сервиса его геолокацию отправлять не нужно: "
+        "бот определяет координаты по адресу.",
+        reply_markup=MAIN_KB,
+    )
+
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("draft", None)
+    await update.message.reply_text("Отменено.", reply_markup=MAIN_KB)
+    return ConversationHandler.END
+
+
+async def begin_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("draft", None)
+    await update.message.reply_text(
+        "➕ Как хотите добавить сервис?\n\n"
+        "📷 Можно отправить визитку или скриншот Google Maps.\n"
+        "📇 Можно отправить контакт.\n"
+        "✍️ Или заполнить всё одним сообщением.",
+        reply_markup=ADD_KB,
+    )
+    return CHOOSE
+
+
+async def choose_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = clean(update.message.text)
+
+    if text == "❌ Отмена":
+        return await cancel(update, context)
+
+    if text == "📷 Фото / скриншот":
+        await update.message.reply_text(
+            "📷 Отправьте фото визитки или скриншот сервиса.\n"
+            "Я постараюсь определить название, телефон, точный адрес, рейтинг и другие данные.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return INPUT
+
+    if text == "✍️ Ввести вручную":
+        await update.message.reply_text(FORM, reply_markup=ReplyKeyboardRemove())
+        return INPUT
+
+    await update.message.reply_text(
+        "Выберите один из вариантов кнопками ниже.",
+        reply_markup=ADD_KB,
+    )
+    return CHOOSE
+
+
+async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    c = update.message.contact
+    name = " ".join(x for x in [c.first_name, c.last_name] if x).strip()
+    context.user_data["draft"] = {
+        "name": name,
+        "category": "Truck Repair",
+        "phone": c.phone_number or "",
+        "address": "",
+        "languages": "",
+        "rating": None,
+        "review_count": None,
+        "hours": "",
+        "website": "",
+        "notes": "",
+    }
+    await update.message.reply_text(
+        "📍 Теперь отправьте адрес сервиса текстом.\n"
+        "Например: 7509 Reese Rd, Sacramento, CA 95828",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return INPUT
+
+
+async def prepare_preview(update, context, draft):
+    address = clean(draft.get("address"))
+
+    # If Places did not already give us coordinates, geocode the address.
+    if draft.get("latitude") is None or draft.get("longitude") is None:
+        if not address:
+            context.user_data["draft"] = draft
+            await update.message.reply_text(
+                "📍 Мне не удалось определить адрес автоматически.\n"
+                "Отправьте только адрес сервиса текстом.\n\n"
+                "Например: 7509 Reese Rd, Sacramento, CA 95828"
+            )
+            return INPUT
+
+        try:
+            geo = google_geocode(address)
+        except Exception:
+            logger.exception("Google geocoding failed")
+            await update.message.reply_text(
+                "⚠️ Google не смог проверить адрес. Проверьте GOOGLE_MAPS_API_KEY "
+                "и что Geocoding API включён."
+            )
+            return INPUT
+
+        if not geo:
+            context.user_data["draft"] = draft
+            await update.message.reply_text(
+                "❌ Не удалось найти этот адрес.\n"
+                "Проверьте улицу, город, штат и ZIP и отправьте адрес ещё раз."
+            )
+            return INPUT
+
+        draft["latitude"], draft["longitude"], draft["address"] = geo
+
+    if not clean(draft.get("name")):
+        context.user_data["draft"] = draft
+        await update.message.reply_text(
+            "Название сервиса не найдено. Отправьте название сервиса."
+        )
+        return INPUT
+
+    context.user_data["draft"] = draft
+    await update.message.reply_text(preview(draft), reply_markup=CONFIRM_KB)
+    return CONFIRM
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🔎 Распознаю фото и ищу сервис в Google…")
+
+    try:
+        photo = update.message.photo[-1]
+        tg_file = await context.bot.get_file(photo.file_id)
+
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+            path = tmp.name
+
+        try:
+            await tg_file.download_to_drive(path)
+            with open(path, "rb") as f:
+                image_bytes = f.read()
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+        text = google_vision_ocr(image_bytes)
+
+        if not text.strip():
+            await update.message.reply_text(
+                "❌ Google Vision не нашёл текст на фото.\n"
+                "Попробуйте более чёткое фото или введите данные вручную.",
+                reply_markup=ADD_KB,
+            )
+            return CHOOSE
+
+        logger.info("OCR text: %s", text[:1500])
+        draft = parse_ocr(text)
+        return await prepare_preview(update, context, draft)
+
+    except Exception as exc:
+        logger.exception("Photo recognition failed")
+        await update.message.reply_text(
+            "⚠️ Не удалось обработать фото.\n"
+            "Проверьте, что GOOGLE_VISION_API_KEY в Railway правильный "
+            "и Cloud Vision API включён.\n\n"
+            f"Ошибка: {str(exc)[:250]}",
+            reply_markup=ADD_KB,
+        )
+        return CHOOSE
+
+
+async def handle_input_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = clean(update.message.text)
+    if text == "❌ Отмена":
+        return await cancel(update, context)
+
+    old = context.user_data.get("draft")
+
+    # Contact/photo was already parsed and now bot is waiting only for address.
+    if old and not clean(old.get("address")) and ":" not in text:
+        old["address"] = text
+        # Force fresh geocoding for the newly supplied address.
+        old.pop("latitude", None)
+        old.pop("longitude", None)
+        return await prepare_preview(update, context, old)
+
+    # If draft exists but name is missing, accept a simple name.
+    if old and not clean(old.get("name")) and ":" not in text:
+        old["name"] = text
+        return await prepare_preview(update, context, old)
+
+    draft = parse_labeled_form(text)
+
+    if not draft:
+        await update.message.reply_text(
+            "Пожалуйста, заполните форму одним сообщением:\n\n" + FORM
+        )
+        return INPUT
+
+    draft.setdefault("category", "Truck Repair")
+    draft.setdefault("phone", "")
+    draft.setdefault("address", "")
+    draft.setdefault("languages", "")
+    draft.setdefault("rating", None)
+    draft.setdefault("review_count", None)
+    draft.setdefault("hours", "")
+    draft.setdefault("website", "")
+    draft.setdefault("notes", "")
+
+    return await prepare_preview(update, context, draft)
+
+
+async def edit_draft(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    draft = context.user_data.get("draft", {})
+    form = (
+        "📝 Измените нужные поля и отправьте всё сообщение:\n\n"
+        f"Название: {clean(draft.get('name'))}\n"
+        f"Категория: {clean(draft.get('category')) or 'Truck Repair'}\n"
+        f"Телефон: {clean(draft.get('phone'))}\n"
+        f"Адрес: {clean(draft.get('address'))}\n"
+        f"Языки: {clean(draft.get('languages'))}\n"
+        f"Рейтинг: {'' if draft.get('rating') is None else draft.get('rating')}\n"
+        f"Отзывы: {'' if draft.get('review_count') is None else draft.get('review_count')}\n"
+        f"Часы: {clean(draft.get('hours'))}\n"
+        f"Сайт: {clean(draft.get('website'))}\n"
+        f"Примечание: {clean(draft.get('notes'))}"
+    )
+    await update.message.reply_text(form, reply_markup=ReplyKeyboardRemove())
+    return INPUT
+
+
+async def save_draft(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    draft = context.user_data.get("draft")
+    if not draft:
+        await update.message.reply_text("Заявка не найдена.", reply_markup=MAIN_KB)
+        return ConversationHandler.END
+
+    # Services are immediately available. No approval queue.
+    service = add_service(
+        name=clean(draft.get("name")),
+        category=clean(draft.get("category")) or "Truck Repair",
+        phone=clean(draft.get("phone")),
+        address=clean(draft.get("address")),
+        latitude=float(draft["latitude"]),
+        longitude=float(draft["longitude"]),
+        notes=clean(draft.get("notes")),
+        submitted_by=update.effective_user.id if update.effective_user else None,
+        approved=True,
+        languages=clean(draft.get("languages")),
+        rating=draft.get("rating"),
+        review_count=draft.get("review_count"),
+        hours=clean(draft.get("hours")),
+        website=clean(draft.get("website")),
+    )
+
+    context.user_data.pop("draft", None)
+    await update.message.reply_text(
+        f"✅ Готово! Сервис #{service.id} сохранён и уже доступен в поиске.",
+        reply_markup=MAIN_KB,
+    )
+    return ConversationHandler.END
+
+
+async def my_services(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user:
+        return
+    services = get_user_services(update.effective_user.id)
+    if not services:
+        await update.message.reply_text(
+            "📋 У вас пока нет добавленных сервисов.",
+            reply_markup=MAIN_KB,
+        )
+        return
+
+    lines = ["📋 Ваши сервисы:"]
+    for s in services[:30]:
+        status = "✅ Сохранён" if s.approved else "⏳ На проверке"
+        lines.append(f"#{s.id} — {s.name} — {status}")
+    await update.message.reply_text("\n".join(lines), reply_markup=MAIN_KB)
+
+
+async def ask_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📍 Отправьте вашу геолокацию, чтобы найти сервисы рядом:",
+        reply_markup=SEARCH_LOCATION_KB,
+    )
+
+
+async def find_nearby(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    loc = update.message.location
+    if not loc:
+        return
+
+    found = []
+    for s in get_approved_services():
+        distance = haversine_miles(
+            loc.latitude,
+            loc.longitude,
+            s.latitude,
+            s.longitude,
+        )
+        if distance <= SEARCH_RADIUS_MILES:
+            found.append((distance, s))
+
+    if not found:
+        await update.message.reply_text(
+            f"В радиусе {SEARCH_RADIUS_MILES:g} миль сервисов пока не найдено.",
+            reply_markup=MAIN_KB,
+        )
+        return
+
+    # Primarily nearest; for almost equal distances, higher-rated services appear first.
+    found.sort(key=lambda item: (round(item[0], 1), -(item[1].rating or 0)))
+
+    await update.message.reply_text(
+        f"🔧 Найдено сервисов: {len(found)}",
+        reply_markup=MAIN_KB,
+    )
+
+    for distance, s in found[:15]:
+        text = f"🔧 {s.name}\n"
+        if s.rating is not None:
+            text += f"⭐ {s.rating}/5"
+            if s.review_count is not None:
+                text += f" · {s.review_count} отзывов"
+            text += "\n"
+        text += f"🏷 {s.category}\n"
+        if s.phone:
+            text += f"📞 {s.phone}\n"
+        if s.address:
+            text += f"📍 {s.address}\n"
+        if getattr(s, "languages", ""):
+            text += f"🌐 Языки: {s.languages}\n"
+        if getattr(s, "hours", ""):
+            text += f"🕐 {s.hours}\n"
+        text += f"📏 {distance:.1f} mi\n"
+        text += (
+            "🗺 Маршрут: https://www.google.com/maps/dir/?api=1&"
+            + urlencode({"destination": f"{s.latitude},{s.longitude}"})
+        )
+        await update.message.reply_text(text)
+
+
+async def pending_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("Нет доступа.")
+        return
+
+    services = get_pending_services()
+    if not services:
+        await update.message.reply_text("Заявок на проверке нет.")
+        return
+
+    lines = ["⏳ Заявки на проверке:"]
+    for s in services:
+        lines.append(f"#{s.id} — {s.name} — {s.address}")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("Нет доступа.")
+        return
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("Использование: /approve ID")
+        return
+    sid = int(context.args[0])
+    if approve_service(sid):
+        await update.message.reply_text(f"✅ Сервис #{sid} одобрен.")
+    else:
+        await update.message.reply_text("Сервис не найден.")
+
+
+async def delete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("Нет доступа.")
+        return
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("Использование: /delete ID")
+        return
+    sid = int(context.args[0])
+    if delete_service(sid):
+        await update.message.reply_text(f"🗑 Сервис #{sid} удалён.")
+    else:
+        await update.message.reply_text("Сервис не найден.")
+
+
+def main():
+    if not TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
+
+    init_db()
+
+    app = Application.builder().token(TOKEN).build()
+
+    add_conversation = ConversationHandler(
+        entry_points=[
+            MessageHandler(filters.Regex(r"^➕ Добавить сервис$"), begin_add),
+        ],
+        states={
+            CHOOSE: [
+                MessageHandler(filters.PHOTO, handle_photo),
+                MessageHandler(filters.CONTACT, handle_contact),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, choose_add),
+            ],
+            INPUT: [
+                MessageHandler(filters.PHOTO, handle_photo),
+                MessageHandler(filters.CONTACT, handle_contact),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_input_text),
+            ],
+            CONFIRM: [
+                MessageHandler(filters.Regex(r"^✅ Сохранить$"), save_draft),
+                MessageHandler(filters.Regex(r"^✏️ Изменить$"), edit_draft),
+                MessageHandler(filters.Regex(r"^❌ Отмена$"), cancel),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        allow_reentry=True,
+    )
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("pending", pending_cmd))
+    app.add_handler(CommandHandler("approve", approve_cmd))
+    app.add_handler(CommandHandler("delete", delete_cmd))
+
+    app.add_handler(add_conversation)
+
+    app.add_handler(
+        MessageHandler(filters.Regex(r"^📍 Найти рядом$"), ask_location)
+    )
+    app.add_handler(
+        MessageHandler(filters.LOCATION, find_nearby)
+    )
+    app.add_handler(
+        MessageHandler(filters.Regex(r"^📋 Мои заявки$"), my_services)
+    )
+    app.add_handler(
+        MessageHandler(filters.Regex(r"^ℹ️ Помощь$"), help_cmd)
+    )
+    app.add_handler(
+        MessageHandler(filters.Regex(r"^❌ Отмена$"), cancel)
+    )
+
+    logger.info("Bot started")
+    app.run_polling(drop_pending_updates=True)
+
+
+if __name__ == "__main__":
+    main()
