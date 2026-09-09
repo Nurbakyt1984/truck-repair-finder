@@ -1,4 +1,2 @@
-python-telegram-bot==21.11.1
-SQLAlchemy==2.0.38
-python-dotenv==1.0.1
-psycopg[binary]==3.2.5
+rapidocr-onnxruntime
+opencv-python-headless
